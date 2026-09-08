@@ -8,7 +8,7 @@ sqlalchemy==2.0.36
 
 # 配置
 pydantic==2.10.4
-pydantic-settings==2.7.0
+pydantic-settings==2.15.0
 python-dotenv==1.0.1
 
 # 日志
@@ -20,15 +20,22 @@ passlib[bcrypt]==1.7.4
 
 # AI / LLM
 openai==1.58.1
-langchain==0.3.13
-langchain-community==0.3.13
+langchain==1.4.0
+langchain-core==1.6.2
+langchain-community==0.4.2
+langchain-text-splitters==1.1.2
+
+# LangChain 独立集成包（替代 langchain-community 中的弃用类）
+langchain-huggingface==1.2.2
+langchain-chroma==1.1.0
 
 # 向量数据库
-chromadb==0.5.23
+chromadb==1.5.9
 
 # 文档解析
 pypdf==5.1.0
 python-docx==1.1.2
+docx2txt==0.9
 
 # Embedding
 sentence-transformers==3.3.1
