@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Dict, Any, Optional
 from openai import OpenAI
 from app.config import settings
@@ -15,37 +16,41 @@ class BaseAgent:
         self.client = OpenAI(
             api_key=settings.SILICONFLOW_API_KEY,
             base_url=settings.LLM_BASE_URL,
-            timeout=90.0  # 单次请求超时90秒，避免网络挂起时长时间阻塞审查流水线
+            timeout=90.0
         )
     
-    def run(self, user_input: str, max_tokens: int = 2000) -> str:
-        """运行 Agent，返回纯文本结果"""
+    def run(self, user_input: str, max_tokens: int = 2000, max_retries: int = 2) -> str:
+        """运行 Agent，返回纯文本结果（带自动重试）"""
         logger.info(f"[{self.name}] 开始处理...")
         
-        try:
-            response = self.client.chat.completions.create(
-                model=settings.LLM_MODEL,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": user_input}
-                ],
-                temperature=self.temperature,
-                max_tokens=max_tokens
-            )
-            result = response.choices[0].message.content
-            logger.info(f"[{self.name}] 处理完成")
-            return result
-        except Exception as e:
-            logger.error(f"[{self.name}] 处理失败: {str(e)}", exc_info=True)
-            raise
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=settings.LLM_MODEL,
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": user_input}
+                    ],
+                    temperature=self.temperature,
+                    max_tokens=max_tokens
+                )
+                result = response.choices[0].message.content
+                logger.info(f"[{self.name}] 处理完成")
+                return result
+            except Exception as e:
+                if attempt < max_retries:
+                    wait_time = 2 ** attempt  # 指数退避：1秒、2秒、4秒
+                    logger.warning(f"[{self.name}] 第{attempt+1}次调用失败，{wait_time}秒后重试: {str(e)[:100]}")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"[{self.name}] 重试{max_retries}次后仍失败: {str(e)}", exc_info=True)
+                    raise
     
     def run_json(self, user_input: str, max_tokens: int = 2000) -> Dict[str, Any]:
         """运行 Agent，返回 JSON 格式结果（自动解析）"""
         result = self.run(user_input, max_tokens)
         
-        # 尝试解析 JSON
         try:
-            # 清理可能的 markdown 代码块标记
             cleaned = result.strip()
             if cleaned.startswith("```json"):
                 cleaned = cleaned[7:]
@@ -59,7 +64,6 @@ class BaseAgent:
         except json.JSONDecodeError as e:
             logger.error(f"[{self.name}] JSON 解析失败: {str(e)}")
             logger.error(f"原始输出: {result[:500]}")
-            # 解析失败时返回原始文本
             return {"raw_output": result, "parse_error": str(e)}
     
     def __repr__(self):

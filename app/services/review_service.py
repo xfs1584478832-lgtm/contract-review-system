@@ -1,6 +1,8 @@
 import json
+import time
 from datetime import datetime
 from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from sqlalchemy.orm import Session
 from app.database import SessionLocal
 from app.models.contract import Contract
@@ -17,9 +19,10 @@ class ReviewService:
         self.risk_agent = RiskAgent()
         self.compliance_agent = ComplianceAgent()
         self.suggestion_agent = SuggestionAgent()
+        self.max_workers = 3  # 并发数，保守设为3，避免API限流
     
     def review_contract(self, contract_id: int, db: Session) -> Dict:
-        """完整审查合同"""
+        """完整审查合同（并发版）"""
         logger.info(f"开始审查合同 ID={contract_id}")
 
         # 1. 获取合同
@@ -30,44 +33,56 @@ class ReviewService:
         if not contract.clauses:
             raise ValueError("合同尚未解析，请先解析合同")
 
+        # 标记审查中
+        contract.status = "reviewing"
+        db.commit()
+
         clauses = contract.clauses
-        logger.info(f"合同共 {len(clauses)} 个条款，开始逐条审查")
+        logger.info(f"合同共 {len(clauses)} 个条款，开始并发审查（{self.max_workers}线程）")
+
+        # 2. 并发审查所有条款
+        review_results = [None] * len(clauses)
         
-        # 2. 逐条审查
-        review_results = []
-        high_risks = 0
-        medium_risks = 0
-        low_risks = 0
-        
-        for i, clause in enumerate(clauses):
-            logger.info(f"审查第 {i+1}/{len(clauses)} 条: {clause.get('title', '')[:30]}")
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # 提交所有任务，记录索引
+            future_to_index = {
+                executor.submit(
+                    self._review_single_clause, 
+                    clause, 
+                    contract.contract_type
+                ): i
+                for i, clause in enumerate(clauses)
+            }
             
-            try:
-                clause_result = self._review_single_clause(
-                    clause=clause,
-                    contract_type=contract.contract_type
-                )
-                review_results.append(clause_result)
-                
-                # 统计风险
-                risk_level = clause_result.get("risk_analysis", {}).get("risk_level", "无")
-                if risk_level == "高":
-                    high_risks += 1
-                elif risk_level == "中":
-                    medium_risks += 1
-                elif risk_level == "低":
-                    low_risks += 1
-                    
-            except Exception as e:
-                logger.error(f"第 {i+1} 条审查失败: {str(e)}")
-                review_results.append({
-                    "clause_index": i + 1,
-                    "clause_title": clause.get("title", ""),
-                    "error": str(e),
-                    "risk_analysis": {"risk_level": "未知", "has_risk": False}
-                })
-        
-        # 3. 生成审查报告
+            # 按完成顺序收集结果
+            completed = 0
+            for future in as_completed(future_to_index):
+                i = future_to_index[future]
+                completed += 1
+                try:
+                    review_results[i] = future.result()
+                    logger.info(f"审查进度: {completed}/{len(clauses)}")
+                except Exception as e:
+                    logger.error(f"第 {i+1} 条审查失败: {str(e)}")
+                    review_results[i] = {
+                        "clause_index": i + 1,
+                        "clause_title": clauses[i].get("title", ""),
+                        "error": str(e),
+                        "risk_analysis": {"risk_level": "未知", "has_risk": False}
+                    }
+
+        # 3. 统计风险
+        high_risks = medium_risks = low_risks = 0
+        for r in review_results:
+            risk_level = r.get("risk_analysis", {}).get("risk_level", "无")
+            if risk_level == "高":
+                high_risks += 1
+            elif risk_level == "中":
+                medium_risks += 1
+            elif risk_level == "低":
+                low_risks += 1
+
+        # 4. 生成审查报告
         report = self._generate_report(
             contract=contract,
             review_results=review_results,
@@ -76,28 +91,22 @@ class ReviewService:
             low_risks=low_risks
         )
         
-        # 4. 保存审查结果到数据库（含审查时间，随报告一起持久化）
+        # 5. 保存审查结果到数据库（含审查时间）
         report["review_time"] = datetime.now().isoformat()
         contract.review_result = report
         contract.status = "reviewed"
         db.commit()
 
         logger.info(f"合同审查完成：高风险 {high_risks}，中风险 {medium_risks}，低风险 {low_risks}")
-
         return report
 
     def review_contract_background(self, contract_id: int):
-        """后台审查任务：使用独立数据库会话，供 FastAPI BackgroundTasks 调用
-
-        审查耗时较长（多条款 × 多 Agent 调用 LLM），放在后台线程执行，
-        接口立即返回；前端通过 GET /review/{id} 轮询审查状态。
-        """
+        """后台审查任务：使用独立数据库会话"""
         db = SessionLocal()
         try:
             self.review_contract(contract_id, db)
         except Exception as e:
             logger.error(f"后台审查失败，合同 ID={contract_id}: {str(e)}", exc_info=True)
-            # 记录失败状态，便于前端查询时感知
             try:
                 contract = db.query(Contract).filter(Contract.id == contract_id).first()
                 if contract:
@@ -110,34 +119,54 @@ class ReviewService:
             db.close()
     
     def _review_single_clause(self, clause: Dict, contract_type: str) -> Dict:
-        """审查单个条款：4个Agent流水线处理"""
+        """审查单个条款：三阶段流水线（阶段1内部并发）
+
+        阶段1（并发，三者互不依赖）：条款抽取Agent / 风险识别Agent / 知识库检索
+        阶段2（依赖检索结果）：合规比对Agent
+        阶段3（依赖风险+合规结果）：修改建议Agent（仅有风险或不合规时）
+        """
+        t_start = time.time()
         clause_title = clause.get("title", "")
         clause_content = clause.get("content", "")
         clause_index = clause.get("index", 0)
-        
-        # Agent 1: 条款抽取分析
-        clause_analysis = self.clause_agent.analyze(clause_title, clause_content)
-        
-        # Agent 2: 风险识别
-        risk_analysis = self.risk_agent.analyze(clause_title, clause_content, contract_type)
-        
-        # Agent 3: 合规比对（每条都先检索法律知识库，为合规判断提供法条依据）
-        has_risk = risk_analysis.get("has_risk", False)
+
+        # 阶段1：条款抽取、风险识别、知识库检索 并发执行
         search_query = f"{clause_title} {clause_content[:100]}"
-        legal_docs = knowledge_service.search(search_query, top_k=2)
+        with ThreadPoolExecutor(max_workers=3) as inner:
+            f_clause = inner.submit(
+                self.clause_agent.analyze, clause_title, clause_content
+            )
+            f_risk = inner.submit(
+                self.risk_agent.analyze, clause_title, clause_content, contract_type
+            )
+            f_search = inner.submit(knowledge_service.search, search_query, 2)
+
+            clause_analysis = f_clause.result()
+            risk_analysis = f_risk.result()
+            legal_docs = f_search.result()
+
+        has_risk = risk_analysis.get("has_risk", False)
+        risk_level = risk_analysis.get("risk_level", "无")
+
         legal_references = "\n\n".join([doc["content"] for doc in legal_docs])
 
+        # 阶段2：合规比对
         compliance_analysis = self.compliance_agent.analyze(
             clause_title, clause_content, legal_references
         )
-        
-        # Agent 4: 修改建议（只有有风险或不合规才生成）
+
+        # 阶段3：修改建议（只有有风险或不合规才生成）
         suggestion_analysis = {}
         if has_risk or not compliance_analysis.get("is_compliant", True):
             suggestion_analysis = self.suggestion_agent.analyze(
                 clause_title, clause_content, risk_analysis, compliance_analysis
             )
-        
+
+        logger.info(
+            f"第 {clause_index} 条「{clause_title}」审查完成，"
+            f"耗时 {time.time() - t_start:.1f}s，风险等级：{risk_level}"
+        )
+
         return {
             "clause_index": clause_index,
             "clause_title": clause_title,
@@ -159,7 +188,6 @@ class ReviewService:
     ) -> Dict:
         """生成审查报告"""
         total_clauses = len(review_results)
-        risky_clauses = high_risks + medium_risks
         
         # 风险等级评定
         if high_risks > 0:
